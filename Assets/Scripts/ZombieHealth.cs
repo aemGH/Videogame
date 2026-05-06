@@ -14,10 +14,32 @@ public class ZombieHealth : MonoBehaviour
 
     private bool isDead = false;
 
+    void Awake()
+    {
+        // Automatically move zombie to the "Enemy" layer so bullets can hit it
+        // and ignore environmental obstacles if necessary.
+        int enemyLayer = LayerMask.NameToLayer("Enemy");
+        if (enemyLayer != -1)
+        {
+            gameObject.layer = enemyLayer;
+            // Also set children (body parts) to this layer
+            foreach (Transform child in GetComponentsInChildren<Transform>(true))
+            {
+                child.gameObject.layer = enemyLayer;
+            }
+        }
+        else
+        {
+            Debug.LogWarning("[ZombieHealth] 'Enemy' layer not found in project. Please create it in 'Tags and Layers'.");
+        }
+    }
+
     void Start()
     {
+        if (maxHealth <= 0) maxHealth = 100f;
         currentHealth = maxHealth;
         aiScript = GetComponent<ZombieAI>();
+        if (aiScript == null) aiScript = GetComponentInParent<ZombieAI>();
     }
 
     public void TakeDamage(float amount)

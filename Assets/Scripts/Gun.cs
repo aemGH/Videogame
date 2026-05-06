@@ -1,23 +1,19 @@
 using UnityEngine;
 using TMPro;
 
-public class GunSystem : MonoBehaviour
+public class Gun : MonoBehaviour
 {
     // Gun stats
     public int damage = 25;
-    public float timeBetweenShooting = 0.1f, spread = 0.02f, range = 100f, reloadTime = 1.5f, timeBetweenShots = 0.05f;
-    public int magazineSize = 30, bulletsPerTap = 1;
+    public float timeBetweenShooting = 0.1f, spread = 0.02f, range = 100f, reloadTime = 1.5f;
+    public int magazineSize = 30;
     public bool allowButtonHold = true;
 
-    int bulletsLeft, bulletsShot;
-
-    // state
+    int bulletsLeft;
     bool shooting, readyToShoot, reloading;
 
     // References
     public Camera fpsCam;
-    public Transform attackPoint;
-    public RaycastHit rayHit;
     public LayerMask whatIsEnemy = ~0;
 
     // Graphics
@@ -36,13 +32,15 @@ public class GunSystem : MonoBehaviour
 
     private void Awake()
     {
-        // FORCE VALID VALUES if inspector left them at 0
+        // Force minimum usable stats if they are set too low in Inspector
         if (magazineSize <= 0) magazineSize = 30;
-        if (damage <= 0) damage = 25;
-        if (bulletsPerTap <= 0) bulletsPerTap = 1;
+        if (damage < 20) damage = 25; 
         if (timeBetweenShooting <= 0f) timeBetweenShooting = 0.1f;
-        if (range <= 0f) range = 100f;
-        if (reloadTime <= 0f) reloadTime = 1.5f;
+        if (range < 10f) range = 100f;
+
+        // Auto-detect Enemy layer
+        int enemyLayer = LayerMask.NameToLayer("Enemy");
+        if (enemyLayer != -1) whatIsEnemy = (1 << enemyLayer) | (1 << 0); // Enemy + Default
 
         bulletsLeft = magazineSize;
         readyToShoot = true;
@@ -50,11 +48,44 @@ public class GunSystem : MonoBehaviour
         if (fpsCam == null) fpsCam = Camera.main;
         if (audioSource == null) audioSource = GetComponent<AudioSource>();
 
-        // KILL THE PINK ARTEFACT
-        foreach (var r in GetComponentsInChildren<Renderer>(true)) {
-            if (r.sharedMaterial != null && (r.sharedMaterial.name.Contains("Internal-Error") || r.sharedMaterial.name.Contains("Hidden"))) {
-                Debug.Log("[GunSystem] Disabled pink renderer: " + r.gameObject.name);
+        // AGGRESSIVE PINK FIX: Check every renderer in the gun hierarchy
+        CleanPinkMaterials(gameObject);
+    }
+
+    private void CleanPinkMaterials(GameObject obj)
+    {
+        foreach (Renderer r in obj.GetComponentsInChildren<Renderer>(true))
+        {
+            if (r.sharedMaterial == null)
+            {
                 r.enabled = false;
+                continue;
+            }
+
+            string shaderName = r.sharedMaterial.shader.name;
+            bool isUnsupported = shaderName.Contains("Error") || 
+                                 shaderName == "Standard" || 
+                                 shaderName == "Standard (Specular setup)" ||
+                                 shaderName.StartsWith("Particles/") || 
+                                 shaderName.StartsWith("Legacy Shaders/") || 
+                                 shaderName.StartsWith("Mobile/");
+
+            if (isUnsupported && !shaderName.Contains("Universal Render Pipeline"))
+            {
+                Debug.Log("[Gun] Fixing broken (pink) renderer: " + r.gameObject.name + " from shader: " + shaderName);
+                
+                if (shaderName.StartsWith("Particles/")) 
+                {
+                    Shader urpParticle = Shader.Find("Universal Render Pipeline/Particles/Unlit");
+                    if (urpParticle != null) r.material.shader = urpParticle;
+                    else r.enabled = false;
+                }
+                else 
+                {
+                    Shader urpLit = Shader.Find("Universal Render Pipeline/Lit");
+                    if (urpLit != null) r.material.shader = urpLit;
+                    else r.enabled = false;
+                }
             }
         }
     }
@@ -67,106 +98,123 @@ public class GunSystem : MonoBehaviour
 
         if (text != null)
             text.SetText(bulletsLeft + " / " + magazineSize);
+            
+        // Occasional check to catch dynamically enabled effects
+        if (Time.frameCount % 60 == 0) CleanPinkMaterials(gameObject);
     }
 
     private void MyInput()
     {
-        if (allowButtonHold)
-            shooting = Input.GetKey(KeyCode.Mouse0);
-        else
-            shooting = Input.GetKeyDown(KeyCode.Mouse0);
+        if (allowButtonHold) shooting = Input.GetKey(KeyCode.Mouse0);
+        else shooting = Input.GetKeyDown(KeyCode.Mouse0);
 
         if (Input.GetKeyDown(KeyCode.R) && bulletsLeft < magazineSize && !reloading)
             Reload();
 
         if (readyToShoot && shooting && !reloading && bulletsLeft > 0)
-        {
-            bulletsShot = bulletsPerTap;
             Shoot();
-        }
     }
 
     private void Shoot()
     {
-        readyToShoot = false;
+        if (GameManager.Instance != null && (GameManager.Instance.isGamePaused || GameManager.Instance.isGameOver))
+            return;
 
+        readyToShoot = false;
         bulletsLeft--;
 
-        // spread
+        // Calculate Direction
         float x = Random.Range(-spread, spread);
         float y = Random.Range(-spread, spread);
-
         Vector3 direction = fpsCam.transform.forward + fpsCam.transform.right * x + fpsCam.transform.up * y;
 
-        // SphereCast with thickness to make hitting zombies much easier
-        if (Physics.SphereCast(fpsCam.transform.position, 0.15f, direction, out rayHit, range, whatIsEnemy))
+        // Visual Debug
+        Debug.DrawRay(fpsCam.transform.position, direction * range, Color.red, 0.5f);
+
+        // Targeted "Thick" Raycast (0.4f sphere is very forgiving)
+        // Offset starting point slightly forward to avoid hitting internal camera colliders
+        Vector3 rayStart = fpsCam.transform.position + fpsCam.transform.forward * 1.0f; 
+        RaycastHit[] hits = Physics.SphereCastAll(rayStart, 0.5f, direction, range, whatIsEnemy, QueryTriggerInteraction.Collide);
+        System.Array.Sort(hits, (a, b) => a.distance.CompareTo(b.distance));
+
+        ZombieHealth zombieFound = null;
+        RaycastHit bestHit = new RaycastHit();
+        bool hitAnything = false;
+
+        // PRIORITY LOOP: Find a zombie anywhere in the sphere before settling for a wall
+        foreach (var hit in hits)
         {
-            // Ignore Player
-            if (rayHit.collider.CompareTag("Player") || rayHit.collider.name.Contains("Player"))
+            // Ignore anything part of the player or the gun itself
+            if (hit.collider.CompareTag("Player") || hit.collider.name.Contains("Player") || hit.collider.transform.IsChildOf(transform.root))
+                continue;
+
+            // IGNORE THE ENVIRONMENT IF IT IS TOO CLOSE (likely clipping)
+            if (hit.distance < 0.2f && !hit.collider.name.Contains("Zombie"))
+                continue;
+
+            ZombieHealth h = hit.collider.GetComponentInParent<ZombieHealth>();
+            if (h == null) h = hit.collider.GetComponentInChildren<ZombieHealth>();
+
+            if (h != null)
             {
-                // Restart raycast from the point of impact moving forward
-                if (!Physics.Raycast(rayHit.point + direction * 0.1f, direction, out rayHit, range - rayHit.distance, whatIsEnemy))
-                {
-                    ResetShot();
-                    return;
-                }
+                zombieFound = h;
+                bestHit = hit;
+                break; // Found a zombie, priority 1!
             }
 
-            Debug.Log("[GunSystem] Hit: " + rayHit.collider.name + " on Layer: " + rayHit.collider.gameObject.layer);
+            if (!hitAnything)
+            {
+                bestHit = hit;
+                hitAnything = true;
+            }
+        }
 
-            // Damage Zombie
-            ZombieHealth target = rayHit.collider.GetComponent<ZombieHealth>();
-            if (target == null) target = rayHit.collider.GetComponentInParent<ZombieHealth>();
+        if (zombieFound != null)
+        {
+            Debug.Log("[Gun] ZOMBIE HIT CONFIRMED: " + zombieFound.gameObject.name);
+            zombieFound.TakeDamage(damage);
+        }
+        else if (hitAnything)
+        {
+            Debug.Log("[Gun] Environment Hit: " + bestHit.collider.name + " | Layer: " + LayerMask.LayerToName(bestHit.collider.gameObject.layer));
             
-            if (target != null)
-            {
-                Debug.Log("[GunSystem] HIT CONFIRMED on Zombie!");
-                target.TakeDamage(damage);
-            }
-            else
-            {
-                // If we didn't hit a zombie directly, check if we hit a body part child
-                ZombieHealth childTarget = rayHit.collider.GetComponentInChildren<ZombieHealth>();
-                if (childTarget != null) {
-                    childTarget.TakeDamage(damage);
-                }
-            }
+            if (bestHit.collider.TryGetComponent(out Target t)) t.TakeDamage(damage);
 
-            if (bulletHoleGraphic != null)
-                Instantiate(bulletHoleGraphic, rayHit.point, Quaternion.LookRotation(rayHit.normal));
+            // Safer instantiation for bullet holes
+            if (bulletHoleGraphic != null && !bestHit.collider.name.Contains("Player")) {
+                GameObject hole = Instantiate(bulletHoleGraphic, bestHit.point + bestHit.normal * 0.01f, Quaternion.LookRotation(bestHit.normal));
+                hole.transform.SetParent(bestHit.collider.transform);
+                
+                // Cleanup pink on hole
+                CleanPinkMaterials(hole);
+                Destroy(hole, 2f); 
+            }
+        }
+        else
+        {
+            Debug.Log("[Gun] Total Miss - SphereCast hit nothing.");
         }
 
         // Effects
         if (camShake != null) camShake.Shake(camShakeDuration, camShakeMagnitude);
-
+        
         if (muzzleFlash != null) {
+            CleanPinkMaterials(muzzleFlash.gameObject);
             muzzleFlash.Play();
         }
 
-        if (audioSource != null && shootSound != null)
-        {
-            audioSource.PlayOneShot(shootSound);
-        }
+        if (audioSource != null && shootSound != null) audioSource.PlayOneShot(shootSound);
 
-        bulletsShot--;
         Invoke(nameof(ResetShot), timeBetweenShooting);
     }
 
-    private void ResetShot()
-    {
-        readyToShoot = true;
-    }
+    private void ResetShot() { readyToShoot = true; }
 
     private void Reload()
     {
         reloading = true;
-        Debug.Log("[GunSystem] Reloading...");
-
-        if (audioSource != null && reloadSound != null)
-        {
-            audioSource.PlayOneShot(reloadSound);
-        }
-
+        Debug.Log("[Gun] Reloading...");
+        if (audioSource != null && reloadSound != null) audioSource.PlayOneShot(reloadSound);
         Invoke(nameof(ReloadFinished), reloadTime);
     }
 
@@ -174,6 +222,6 @@ public class GunSystem : MonoBehaviour
     {
         bulletsLeft = magazineSize;
         reloading = false;
-        Debug.Log("[GunSystem] Reload Complete. Bullets: " + bulletsLeft);
+        Debug.Log("[Gun] Reload Complete.");
     }
 }

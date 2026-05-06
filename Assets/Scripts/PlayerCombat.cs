@@ -42,13 +42,20 @@ public class PlayerCombat : MonoBehaviour
 
         if (Physics.Raycast(ray, out hit, range))
         {
-            // VAcifier si on touche un zombie
-            ZombieHealth target = hit.transform.GetComponent<ZombieHealth>();
-            if (target == null) target = hit.transform.GetComponentInParent<ZombieHealth>();
+            // Vérifier si on touche un zombie
+            ZombieHealth target = hit.collider.GetComponentInParent<ZombieHealth>();
+            if (target == null) target = hit.collider.GetComponentInChildren<ZombieHealth>();
             
             if (target != null)
             {
+                Debug.Log("[PlayerCombat] Hit zombie: " + target.gameObject.name);
                 target.TakeDamage(damage);
+            }
+            else
+            {
+                // Fallback for Target
+                Target altTarget = hit.collider.GetComponentInParent<Target>();
+                if (altTarget != null) altTarget.TakeDamage(damage);
             }
         }
     }
